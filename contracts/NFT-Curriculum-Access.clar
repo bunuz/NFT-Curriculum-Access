@@ -27,6 +27,15 @@
 (define-constant err-invalid-learning-path-name (err u117))
 (define-constant err-invalid-course-sequence (err u118))
 (define-constant err-max-badges-reached (err u119))
+(define-constant err-invalid-study-group (err u120))
+(define-constant err-not-group-member (err u121))
+(define-constant err-group-full (err u122))
+(define-constant err-already-member (err u123))
+(define-constant err-invalid-review (err u124))
+(define-constant err-cannot-review-self (err u125))
+
+(define-constant MAX_GROUP_SIZE u10)
+(define-constant COLLABORATION_BADGE_THRESHOLD u50)
 
 ;; data vars
 (define-data-var last-token-id uint u0)
@@ -35,6 +44,8 @@
 (define-data-var last-badge-id uint u0)
 (define-data-var last-learning-path-id uint u0)
 (define-data-var total-badges-awarded uint u0)
+(define-data-var last-study-group-id uint u0)
+(define-data-var last-peer-review-id uint u0)
 
 ;; data maps
 (define-map token-count principal uint)
@@ -97,6 +108,33 @@
 
 (define-map course-prerequisites uint (list 5 uint))
 (define-map badge-achievements principal (list 50 uint))
+
+(define-map study-groups uint {
+  name: (string-utf8 64),
+  course-id: uint,
+  creator: principal,
+  members: (list 10 principal),
+  member-count: uint,
+  topic: (string-utf8 256),
+  is-active: bool,
+  created-at: uint
+})
+
+(define-map student-study-groups {student: principal, group-id: uint} bool)
+
+(define-map peer-reviews uint {
+  reviewer: principal,
+  reviewee: principal,
+  token-id: uint,
+  rating: uint,
+  feedback: (string-utf8 512),
+  helpful-count: uint,
+  submitted-at: uint
+})
+
+(define-map collaboration-points principal uint)
+
+(define-map token-peer-reviews {token-id: uint} (list 20 uint))
 
 ;; NFT implementation
 (define-non-fungible-token course-pass uint)
@@ -505,3 +543,195 @@
                 {assessments: (get assessments acc), index: (+ (get index acc) u1), correct: (+ (get correct acc) u1)}
                 {assessments: (get assessments acc), index: (+ (get index acc) u1), correct: (get correct acc)})
             acc)))
+
+;; ===== PEER REVIEW & COLLABORATION FUNCTIONS =====
+
+;; Study Group Functions
+(define-public (create-study-group
+  (name (string-utf8 64))
+  (course-id uint)
+  (topic (string-utf8 256))
+)
+  (let (
+    (group-id (+ (var-get last-study-group-id) u1))
+    (caller tx-sender)
+    (course (unwrap! (map-get? courses course-id) err-invalid-course))
+  )
+    (asserts! (> (len name) u0) err-invalid-study-group)
+    (asserts! (get is-active course) err-course-not-active)
+    
+    (map-set study-groups group-id {
+      name: name,
+      course-id: course-id,
+      creator: caller,
+      members: (list caller),
+      member-count: u1,
+      topic: topic,
+      is-active: true,
+      created-at: stacks-block-height
+    })
+    
+    (map-set student-study-groups {student: caller, group-id: group-id} true)
+    (var-set last-study-group-id group-id)
+    
+    (ok group-id)
+  )
+)
+
+(define-public (join-study-group (group-id uint))
+  (let (
+    (group (unwrap! (map-get? study-groups group-id) err-invalid-study-group))
+    (caller tx-sender)
+    (current-members (get members group))
+  )
+    (asserts! (get is-active group) err-invalid-study-group)
+    (asserts! (< (get member-count group) MAX_GROUP_SIZE) err-group-full)
+    (asserts! (is-none (index-of current-members caller)) err-already-member)
+    
+    (let ((updated-members (unwrap! (as-max-len? (append current-members caller) u10) err-group-full)))
+      (map-set study-groups group-id (merge group {
+        members: updated-members,
+        member-count: (+ (get member-count group) u1)
+      }))
+      
+      (map-set student-study-groups {student: caller, group-id: group-id} true)
+      (ok true)
+    )
+  )
+)
+
+(define-public (leave-study-group (group-id uint))
+  (let (
+    (group (unwrap! (map-get? study-groups group-id) err-invalid-study-group))
+    (caller tx-sender)
+    (current-members (get members group))
+  )
+    (asserts! (is-some (index-of current-members caller)) err-not-group-member)
+    
+    (let ((updated-members (filter remove-member current-members)))
+      (map-set study-groups group-id (merge group {
+        members: updated-members,
+        member-count: (- (get member-count group) u1)
+      }))
+      
+      (map-delete student-study-groups {student: caller, group-id: group-id})
+      (ok true)
+    )
+  )
+)
+
+(define-private (remove-member (member principal))
+  (not (is-eq member tx-sender))
+)
+
+;; Peer Review Functions
+(define-public (submit-peer-review
+  (reviewee principal)
+  (token-id uint)
+  (rating uint)
+  (feedback (string-utf8 512))
+)
+  (let (
+    (review-id (+ (var-get last-peer-review-id) u1))
+    (caller tx-sender)
+    (pass (unwrap! (map-get? course-passes {token-id: token-id}) err-not-found))
+    (existing-reviews (default-to (list) (map-get? token-peer-reviews {token-id: token-id})))
+  )
+    (asserts! (not (is-eq caller reviewee)) err-cannot-review-self)
+    (asserts! (is-eq reviewee (get student pass)) err-unauthorized)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-review)
+    
+    (map-set peer-reviews review-id {
+      reviewer: caller,
+      reviewee: reviewee,
+      token-id: token-id,
+      rating: rating,
+      feedback: feedback,
+      helpful-count: u0,
+      submitted-at: stacks-block-height
+    })
+    
+    (map-set token-peer-reviews {token-id: token-id} 
+      (unwrap! (as-max-len? (append existing-reviews review-id) u20) err-max-badges-reached))
+    
+    ;; Award collaboration points to reviewer
+    (let ((current-points (default-to u0 (map-get? collaboration-points caller))))
+      (map-set collaboration-points caller (+ current-points u10))
+      
+      ;; Check if reviewer qualifies for collaboration badge
+      (if (>= (+ current-points u10) COLLABORATION_BADGE_THRESHOLD)
+        (ok {review-submitted: true, badge-earned: true})
+        (ok {review-submitted: true, badge-earned: false})
+      )
+    )
+  )
+)
+
+(define-public (mark-review-helpful (review-id uint))
+  (let (
+    (review (unwrap! (map-get? peer-reviews review-id) err-not-found))
+    (caller tx-sender)
+  )
+    (asserts! (not (is-eq caller (get reviewer review))) err-unauthorized)
+    
+    (map-set peer-reviews review-id (merge review {
+      helpful-count: (+ (get helpful-count review) u1)
+    }))
+    
+    ;; Award bonus collaboration points to original reviewer
+    (let (
+      (reviewer (get reviewer review))
+      (current-points (default-to u0 (map-get? collaboration-points reviewer)))
+    )
+      (map-set collaboration-points reviewer (+ current-points u5))
+      (ok true)
+    )
+  )
+)
+
+;; Read-Only Functions for Peer Review & Collaboration
+(define-read-only (get-study-group (group-id uint))
+  (map-get? study-groups group-id)
+)
+
+(define-read-only (is-group-member (student principal) (group-id uint))
+  (default-to false (map-get? student-study-groups {student: student, group-id: group-id}))
+)
+
+(define-read-only (get-peer-review (review-id uint))
+  (map-get? peer-reviews review-id)
+)
+
+(define-read-only (get-token-peer-reviews (token-id uint))
+  (map-get? token-peer-reviews {token-id: token-id})
+)
+
+(define-read-only (get-collaboration-points (student principal))
+  (default-to u0 (map-get? collaboration-points student))
+)
+
+(define-read-only (get-peer-review-average (token-id uint))
+  (let (
+    (review-ids (default-to (list) (map-get? token-peer-reviews {token-id: token-id})))
+    (review-count (len review-ids))
+  )
+    (if (> review-count u0)
+      (ok (/ (fold sum-review-ratings review-ids u0) review-count))
+      (ok u0)
+    )
+  )
+)
+
+(define-private (sum-review-ratings (review-id uint) (sum uint))
+  (match (map-get? peer-reviews review-id)
+    review (+ sum (get rating review))
+    sum
+  )
+)
+
+(define-read-only (get-collaboration-stats (student principal))
+  {
+    collaboration-points: (default-to u0 (map-get? collaboration-points student)),
+    qualifies-for-badge: (>= (default-to u0 (map-get? collaboration-points student)) COLLABORATION_BADGE_THRESHOLD)
+  }
+)
